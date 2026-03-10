@@ -15,6 +15,8 @@
 pub mod bootstrap;
 pub mod bundled;
 pub mod hook;
+#[cfg(feature = "nats")]
+pub mod nats_publish;
 pub mod registry;
 
 pub use bootstrap::{HookBootstrapSummary, bootstrap_hooks};
@@ -22,4 +24,6 @@ pub use bundled::{
     HookBundleConfig, HookRegistrationSummary, register_bundle, register_bundled_hooks,
 };
 pub use hook::{Hook, HookContext, HookError, HookEvent, HookFailureMode, HookOutcome, HookPoint};
+#[cfg(feature = "nats")]
+pub use nats_publish::{NatsPublishConfig, NatsPublishHook};
 pub use registry::HookRegistry;

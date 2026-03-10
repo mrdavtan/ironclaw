@@ -51,6 +51,17 @@ pub async fn bootstrap_hooks(
     summary.outbound_webhooks += bundled.outbound_webhooks;
     summary.errors += bundled.errors;
 
+    // Register NATS publish hook when the nats feature is enabled.
+    #[cfg(feature = "nats")]
+    {
+        let nats_hook = crate::hooks::nats_publish::NatsPublishHook::from_env();
+        registry
+            .register_with_priority(Arc::new(nats_hook), 100)
+            .await;
+        summary.bundled_hooks += 1;
+        tracing::info!("NATS publish hook registered (otoflo.chat.* events)");
+    }
+
     let plugin = register_plugin_bundles(
         registry,
         wasm_tools_dir,
