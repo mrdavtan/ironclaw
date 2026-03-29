@@ -7,9 +7,11 @@
 //! - `commands` - System commands and job handlers
 //! - `thread_ops` - Thread/session operations (user input, undo, approval, persistence)
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::StreamExt;
+use uuid::Uuid;
 
 use crate::agent::context_monitor::ContextMonitor;
 use crate::agent::heartbeat::spawn_heartbeat;
@@ -99,6 +101,19 @@ pub struct Agent {
     /// Optional slot to expose the routine engine to the gateway for manual triggering.
     pub(super) routine_engine_slot:
         Option<Arc<tokio::sync::RwLock<Option<Arc<crate::agent::routine_engine::RoutineEngine>>>>>,
+    /// Frozen workspace system prompts, keyed by thread ID.
+    ///
+    /// The workspace identity files (MEMORY.md, SOUL.md, etc.) are read once per
+    /// thread and cached here. Subsequent turns in the same thread reuse the frozen
+    /// copy, keeping the system prompt byte-identical across turns. This preserves
+    /// the LLM provider's prefix cache (especially Anthropic's `cache_control`),
+    /// avoiding redundant re-encoding of the full system prompt on every turn.
+    ///
+    /// Invalidated after compaction (which writes to daily logs) and when a thread
+    /// is cleared. Mid-session memory writes go to disk immediately but do NOT
+    /// update this cache — the model knows the write succeeded from the tool
+    /// response, and the fresh content appears on the next session.
+    pub(super) frozen_system_prompts: tokio::sync::RwLock<HashMap<Uuid, String>>,
 }
 
 impl Agent {
@@ -152,6 +167,7 @@ impl Agent {
             hygiene_config,
             routine_config,
             routine_engine_slot: None,
+            frozen_system_prompts: tokio::sync::RwLock::new(HashMap::new()),
         }
     }
 
@@ -205,6 +221,55 @@ impl Agent {
 
     pub(super) fn skill_registry(&self) -> Option<&Arc<std::sync::RwLock<SkillRegistry>>> {
         self.deps.skill_registry.as_ref()
+    }
+
+    /// Get the frozen system prompt for a thread, or build and cache it.
+    ///
+    /// On first call for a given thread, reads workspace identity files from disk
+    /// and caches the rendered prompt. Subsequent calls return the cached copy,
+    /// keeping the system prompt byte-identical across turns for prefix cache
+    /// stability.
+    pub(super) async fn frozen_system_prompt(
+        &self,
+        thread_id: Uuid,
+        is_group_chat: bool,
+        tz: chrono_tz::Tz,
+    ) -> Option<String> {
+        // Fast path: check cache under read lock
+        {
+            let cache: tokio::sync::RwLockReadGuard<'_, HashMap<Uuid, String>> =
+                self.frozen_system_prompts.read().await;
+            if let Some(cached) = cache.get(&thread_id) {
+                return Some(cached.clone());
+            }
+        }
+
+        // Slow path: build from workspace and cache under write lock
+        let ws = self.workspace()?;
+        let prompt = match ws.system_prompt_for_context_tz(is_group_chat, tz).await {
+            Ok(p) if !p.is_empty() => p,
+            Ok(_) => return None,
+            Err(e) => {
+                tracing::debug!("Could not load workspace system prompt: {}", e);
+                return None;
+            }
+        };
+
+        let mut cache: tokio::sync::RwLockWriteGuard<'_, HashMap<Uuid, String>> =
+            self.frozen_system_prompts.write().await;
+        // Double-check: another task may have populated it while we were building
+        cache.entry(thread_id).or_insert_with(|| prompt.clone());
+        Some(prompt)
+    }
+
+    /// Invalidate the frozen system prompt for a specific thread.
+    ///
+    /// Called after compaction (which writes to daily logs) or thread clear.
+    /// The next turn will re-read workspace identity files from disk.
+    pub(super) async fn invalidate_frozen_prompt(&self, thread_id: Uuid) {
+        let mut cache: tokio::sync::RwLockWriteGuard<'_, HashMap<Uuid, String>> =
+            self.frozen_system_prompts.write().await;
+        cache.remove(&thread_id);
     }
 
     pub(super) fn skill_catalog(&self) -> Option<&Arc<crate::skills::catalog::SkillCatalog>> {
@@ -1001,5 +1066,44 @@ mod tests {
         let result = truncate_for_preview(input, 8);
         // 'h','e','l','l','o',' ','世','界' = 8 chars
         assert_eq!(result, "hello 世界...");
+    }
+
+    #[tokio::test]
+    async fn test_frozen_system_prompt_cache_and_invalidation() {
+        use std::collections::HashMap;
+        use uuid::Uuid;
+
+        // Verify the frozen prompt cache stores, returns, and invalidates correctly.
+        // This is a unit test of the RwLock<HashMap> mechanics, not the full Agent.
+        let cache: tokio::sync::RwLock<HashMap<Uuid, String>> =
+            tokio::sync::RwLock::new(HashMap::new());
+        let thread_id = Uuid::new_v4();
+        let prompt = "## Agent Instructions\n\nYou are helpful.".to_string();
+
+        // Initially empty
+        assert!(cache.read().await.get(&thread_id).is_none());
+
+        // Insert
+        cache.write().await.insert(thread_id, prompt.clone());
+
+        // Cache hit returns the same string
+        let cached = cache.read().await.get(&thread_id).cloned();
+        assert_eq!(cached, Some(prompt.clone()));
+
+        // Invalidation removes the entry
+        cache.write().await.remove(&thread_id);
+        assert!(cache.read().await.get(&thread_id).is_none());
+
+        // Other threads are unaffected
+        let other_id = Uuid::new_v4();
+        cache
+            .write()
+            .await
+            .insert(other_id, "other prompt".to_string());
+        cache.write().await.remove(&thread_id); // no-op
+        assert_eq!(
+            cache.read().await.get(&other_id).cloned(),
+            Some("other prompt".to_string())
+        );
     }
 }

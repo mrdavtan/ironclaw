@@ -227,6 +227,10 @@ impl Agent {
                     .await
                 {
                     tracing::warn!("Auto-compaction failed: {}", e);
+                } else {
+                    // Compaction may write to the daily log; invalidate the frozen
+                    // system prompt so the next turn picks up the new content.
+                    self.invalidate_frozen_prompt(thread_id).await;
                 }
             }
         }
@@ -635,6 +639,10 @@ impl Agent {
             .await
         {
             Ok(result) => {
+                // Invalidate frozen system prompt so next turn re-reads workspace
+                // (compaction may have written summaries to the daily log).
+                self.invalidate_frozen_prompt(thread_id).await;
+
                 let mut msg = format!(
                     "Compacted: {} turns removed, {} → {} tokens (was {:.1}% full)",
                     result.turns_removed, result.tokens_before, result.tokens_after, usage
@@ -664,6 +672,10 @@ impl Agent {
         // Clear undo history too
         let undo_mgr = self.session_manager.get_undo_manager(thread_id).await;
         undo_mgr.lock().await.clear();
+
+        // Invalidate frozen system prompt so the next turn re-reads from disk
+        // (the user may have edited workspace files between /clear and the next message).
+        self.invalidate_frozen_prompt(thread_id).await;
 
         Ok(SubmissionResult::ok_with_message("Thread cleared."))
     }

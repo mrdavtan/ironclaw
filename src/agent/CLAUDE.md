@@ -53,7 +53,7 @@ The `dispatcher.rs` module handles **direct conversational turns** (user message
 
 ```
 run_agentic_loop()  [dispatcher.rs — conversational turns]
-  1. Load workspace system prompt (identity files: AGENTS.md, SOUL.md, etc.)
+  1. Get frozen system prompt (cached per thread, see below)
   2. Detect group chat from metadata; exclude MEMORY.md if group chat
   3. Select active skills (keyword/pattern scoring against message content)
   4. Build skill context block (injected before user message)
@@ -65,6 +65,12 @@ run_agentic_loop()  [dispatcher.rs — conversational turns]
      d. Feed results back → goto 5
   7. Return AgenticLoopResult::Response or NeedApproval
 ```
+
+**Frozen system prompt:** Workspace identity files (AGENTS.md, SOUL.md, USER.md, MEMORY.md, daily logs) are read from disk on the **first turn of a thread** and cached in `Agent.frozen_system_prompts` (keyed by thread ID). Subsequent turns reuse the cached copy, keeping the system prompt byte-identical across turns. This preserves the LLM provider's prefix cache — especially Anthropic's `CacheRetention` — avoiding redundant re-encoding of the full system prompt on every turn.
+
+Mid-session `memory_write` calls persist to disk immediately but do NOT update the frozen prompt. The model knows the write succeeded from the tool response. Fresh content appears after compaction (which invalidates the cache) or on the next session.
+
+**Invalidation triggers:** compaction (auto or `/compact`), `/clear`. See `invalidate_frozen_prompt()` in `agent_loop.rs`.
 
 **Tool approval:** Tools flagged `requires_approval` pause the loop and return `NeedApproval`. The web gateway stores the `PendingApproval` in session state and sends an `approval_needed` SSE event. The user's approval/deny resumes the loop.
 
@@ -84,6 +90,8 @@ Three strategies, chosen by `ContextMonitor.suggest_compaction()` based on usage
 - **MoveToWorkspace** — Writes full turn transcript to workspace daily log, keeps 10 recent turns. Used when usage is 80–85% (moderate). Falls back to `Truncate(5)` if no workspace.
 - **Summarize** (`keep_recent: N`) — LLM generates a summary of old turns, writes it to workspace daily log (`daily/YYYY-MM-DD.md`), removes old turns. Used when usage is 85–95%.
 - **Truncate** (`keep_recent: N`) — Removes oldest turns without summarization (fast path). Used when usage >95% (critical).
+
+After successful compaction, `invalidate_frozen_prompt(thread_id)` is called so the next turn re-reads workspace identity files from disk (compaction may have written to the daily log).
 
 If the LLM call for summarization fails, the error propagates — turns are **not** truncated on failure.
 

@@ -63,6 +63,14 @@ let results = workspace.search("dark mode preference", 5).await?;
 let prompt = workspace.system_prompt().await?;
 ```
 
+## Frozen Snapshot Pattern
+
+The dispatcher does NOT call `system_prompt_for_context_tz()` on every turn. Instead, the workspace system prompt is read once per thread and cached in `Agent.frozen_system_prompts`. This keeps the system prompt byte-identical across turns, preserving the LLM provider's prefix cache (Anthropic's `CacheRetention`).
+
+**Writes are durable, reads are deferred:** `memory_write` persists to the database immediately, but the system prompt cache is not updated. The model knows the write succeeded from the tool response. The cache is invalidated after compaction or `/clear`, and fresh content appears on the next session.
+
+See `agent_loop.rs`: `frozen_system_prompt()`, `invalidate_frozen_prompt()`.
+
 ## Memory Tools
 
 Four tools for LLM use:

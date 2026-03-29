@@ -57,21 +57,13 @@ impl Agent {
             &self.config.default_timezone,
         );
 
-        let system_prompt = if let Some(ws) = self.workspace() {
-            match ws
-                .system_prompt_for_context_tz(is_group_chat, user_tz)
-                .await
-            {
-                Ok(prompt) if !prompt.is_empty() => Some(prompt),
-                Ok(_) => None,
-                Err(e) => {
-                    tracing::debug!("Could not load workspace system prompt: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        // Use the frozen system prompt: reads workspace identity files on the
+        // first turn for this thread, then returns the cached copy on subsequent
+        // turns. This keeps the system prompt byte-identical across turns,
+        // preserving the LLM provider's prefix cache.
+        let system_prompt = self
+            .frozen_system_prompt(thread_id, is_group_chat, user_tz)
+            .await;
 
         // Select and prepare active skills (if skills system is enabled)
         let active_skills = self.select_active_skills(&message.content);
